@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>PUBG Direction Ring</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+        html, body {
+            margin: 0;
+            height: 100%;
+            background: #0b0e12;
+            color: #e7edf5;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+
+        #wrap {
+            position: fixed;
+            inset: 0;
+            display: grid;
+            place-items: center;
+        }
+
+        canvas {
+            width: min(92vw, 92vh);
+            height: min(92vw, 92vh);
+            touch-action: manipulation;
+        }
+
+        .hud {
+            position: fixed;
+            left: 16px;
+            top: 16px;
+            right: 16px;
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            font-size: 14px;
+            opacity: 0.9;
+            pointer-events: none;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 10px 12px;
+            backdrop-filter: blur(6px);
+        }
+
+        .small {
+            font-size: 12px;
+            opacity: 0.85;
+        }
+
+        .ok {
+            color: #57ff9a;
+        }
+
+        .warn {
+            color: #ffd166;
+        }
+    </style>
+</head>
+<body>
+<div id="wrap">
+    <canvas id="ring"></canvas>
+</div>
+
+<div class="hud">
+    <div class="card">
+        <div><strong>Direction</strong></div>
+        <div id="summary">idle</div>
+        <div id="confidence" class="small">confidence: 0%</div>
+    </div>
+
+    <div class="card" style="text-align:right;">
+        <div><strong>Status</strong></div>
+        <div id="wsStatus" class="warn">connecting...</div>
+        <div class="small">Open this page on phone too</div>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById("ring");
+    const ctx = canvas.getContext("2d");
+
+    const summaryEl = document.getElementById("summary");
+    const confidenceEl = document.getElementById("confidence");
+    const wsStatusEl = document.getElementById("wsStatus");
+
+    const state = {
+        active: false,
+        center_deg: 0,
+        width_deg: 0,
+        confidence: 0,
+        mode: "idle",
+        side: "unknown",
+        ts: 0,
+        lastMessageMs: 0,
+    };
+
+    function resize() {
+        const size = Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.92);
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        canvas.width = size * dpr;
+        canvas.height = size * dpr;
+        canvas.style.width = size + "px";
+        canvas.style.height = size + "px";
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function degToRad(deg) {
+        return (deg - 90) * Math.PI / 180;
+    }
+
+    function drawTicks(cx, cy, radius) {
+        for (let deg = 0; deg < 360; deg += 15) {
+            const a = degToRad(deg);
+            const inner = deg % 90 === 0 ? radius - 22 : radius - 12;
+            const outer = radius + 4;
+
+            ctx.beginPath();
+            ctx.strokeStyle = deg % 90 === 0 ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.16)";
+            ctx.lineWidth = deg % 90 === 0 ? 3 : 1.5;
+            ctx.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner);
+            ctx.lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer);
+            ctx.stroke();
+        }
+    }
+
+    function drawLabels(cx, cy, radius) {
+        const labels = [
+            {text: "0° / FRONT", deg: 0},
+            {text: "90° / RIGHT", deg: 90},
+            {text: "180° / BACK", deg: 180},
+            {text: "270° / LEFT", deg: 270},
+        ];
+
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.font = "14px Arial";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        for (const label of labels) {
+            const a = degToRad(label.deg);
+            const r = radius + 32;
+            ctx.fillText(label.text, cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+        }
+    }
+
+    function drawBaseRing(cx, cy, radius) {
+        ctx.beginPath();
+        ctx.strokeStyle = "rgba(255,255,255,0.10)";
+        ctx.lineWidth = 26;
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.strokeStyle = "rgba(255,255,255,0.22)";
+        ctx.lineWidth = 2;
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+
+    function drawSector(cx, cy, radius, centerDeg, widthDeg, alpha) {
+        const startDeg = centerDeg - widthDeg / 2;
+        const endDeg = centerDeg + widthDeg / 2;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.strokeStyle = `rgba(87,255,154,${alpha})`;
+        ctx.lineWidth = 26;
+        ctx.lineCap = "round";
+        ctx.shadowBlur = 24;
+        ctx.shadowColor = `rgba(87,255,154,${alpha})`;
+        ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(endDeg), false);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    function drawCenter(cx, cy) {
+        ctx.fillStyle = "rgba(255,255,255,0.9)";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        ctx.font = "bold 28px Arial";
+        const txt = state.active
+            ? `${Math.round(state.center_deg)}°`
+            : "IDLE";
+        ctx.fillText(txt, cx, cy - 10);
+
+        ctx.font = "14px Arial";
+        const sub = state.active
+            ? `${state.side} • ${state.mode}`
+            : "waiting for shot";
+        ctx.fillText(sub, cx, cy + 22);
+    }
+
+    function render() {
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        const cx = w / 2;
+        const cy = h / 2;
+        const radius = Math.min(w, h) * 0.34;
+
+        ctx.clearRect(0, 0, w, h);
+
+        drawBaseRing(cx, cy, radius);
+        drawTicks(cx, cy, radius);
+        drawLabels(cx, cy, radius);
+
+        const ageMs = Date.now() - state.lastMessageMs;
+        const fresh = ageMs < 1200;
+        const alpha = state.active && fresh
+            ? Math.max(0.18, 0.35 + state.confidence * 0.65)
+            : 0.0;
+
+        if (state.active && fresh && state.width_deg > 0) {
+            drawSector(cx, cy, radius, state.center_deg, state.width_deg, alpha);
+        }
+
+        drawCenter(cx, cy);
+
+        summaryEl.textContent = state.active
+            ? `${Math.round(state.center_deg)}° sector, width ${Math.round(state.width_deg)}°`
+            : "idle";
+
+        confidenceEl.textContent = `confidence: ${Math.round((state.confidence || 0) * 100)}%`;
+
+        requestAnimationFrame(render);
+    }
+
+    function connect() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        const ws = new WebSocket(`${proto}://${location.host}/ws?role=viewer`);
+
+        ws.onopen = () => {
+            wsStatusEl.textContent = "connected";
+            wsStatusEl.className = "ok";
+        };
+
+        ws.onclose = () => {
+            wsStatusEl.textContent = "disconnected";
+            wsStatusEl.className = "warn";
+            setTimeout(connect, 1000);
+        };
+
+        ws.onerror = () => {
+            ws.close();
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const payload = JSON.parse(event.data);
+                Object.assign(state, payload);
+                state.lastMessageMs = Date.now();
+            } catch (_) {
+            }
+        };
+    }
+
+    window.addEventListener("resize", resize);
+    resize();
+    connect();
+    render();
+</script>
+</body>
+</html>
