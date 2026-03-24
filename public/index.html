@@ -342,10 +342,11 @@
 
         debugEl.textContent =
             `side: ${state.side}  mode: ${state.mode}
+|ILD|: ${Number(state.ild_abs || 0).toFixed(1)} dB ${Number(state.ild_abs || 0) >= 1.2 ? '★ directional' : '· centered'}
 rightness: ${Number(state.rightness || 0).toFixed(3)}
-ILD: ${Number(state.ild_db || 0).toFixed(2)} dB
 mouse_dx: ${Number(state.mouse_dx || 0).toFixed(1)}
-front: ${Number(state.front_score || 0).toFixed(2)}  back: ${Number(state.back_score || 0).toFixed(2)}`;
+front: ${Number(state.front_score || 0).toFixed(2)}  back: ${Number(state.back_score || 0).toFixed(2)}
+dir_frames: ${state.dir_frames || 0}`;
 
         requestAnimationFrame(render);
     }

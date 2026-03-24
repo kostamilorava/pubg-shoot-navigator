@@ -36,6 +36,9 @@ EVENT_MAX_MS      = 15000   # hard cap — auto fire can last many seconds
 # ILD / rightness
 RIGHTNESS_EMA     = 0.18    # slower smoothing = more stable (was 0.35)
 OUTPUT_ANGLE_EMA  = 0.25    # smooth the output angle between frames
+ILD_MIN_DB        = 1.2     # minimum |ILD| in dB to count as directional
+                            # bullet impacts on your body are ~0 dB (centered)
+                            # gunfire from a direction is typically 3–15 dB
 
 # Mouse correlation
 MOUSE_WINDOW_MS   = 150
@@ -322,16 +325,31 @@ def main():
 
             # --- Active event processing ---
             if event is not None:
-                # Accumulate rightness samples (for weighted average)
-                event["rightness_accum"].append(smooth_rightness)
+                # How "directional" is this frame?
+                abs_ild = abs(ild_db)
+                is_directional = abs_ild >= ILD_MIN_DB
+
+                # Only accumulate rightness from DIRECTIONAL frames.
+                # Bullet impacts on your body are centered (~0 dB ILD)
+                # and would wash out the actual gunfire direction.
+                if is_directional:
+                    weight = abs_ild  # stronger separation = more weight
+                    event["rightness_accum"].append((smooth_rightness, weight))
 
                 # --- Mouse-audio correlation ---
+                # Also weight by directional strength — centered frames
+                # contribute nothing to front/back resolution
                 delta_r = smooth_rightness - event["prev_rightness"]
                 event["prev_rightness"] = smooth_rightness
 
-                if abs(mouse_dx) >= MOVE_MIN_PX and abs(delta_r) >= DELTA_R_MIN:
+                if (abs(mouse_dx) >= MOVE_MIN_PX
+                        and abs(delta_r) >= DELTA_R_MIN
+                        and is_directional):
                     product = mouse_dx * delta_r
-                    score = min(abs(product), 40.0)
+                    # Scale score by ILD strength — directional frames
+                    # contribute more to the front/back decision
+                    ild_weight = min(abs_ild / 3.0, 3.0)  # 3 dB → 1x, 9 dB → 3x
+                    score = min(abs(product) * ild_weight, 80.0)
 
                     if product < 0:
                         event["front_score"] += score
@@ -340,35 +358,37 @@ def main():
                     event["corr_samples"] += 1
 
                 # --- Energy sustain ---
-                # Use the frozen noise floor from event start, NOT the live
-                # one which drifts upward during sustained fire.
-                # Two tiers:
-                #   Strong energy (2x frozen) → extend generously (300ms)
-                #   Moderate energy (1.3x frozen) → extend a bit (80ms)
                 fn = event["frozen_noise"]
                 if current_rms > max(fn * 2.0, ABS_MIN_RMS):
                     event["until"] = max(event["until"], now + 0.30)
                 elif current_rms > max(fn * 1.3, ABS_MIN_RMS * 0.5):
                     event["until"] = max(event["until"], now + 0.08)
 
-                # Hard cap (sustained auto fire can last many seconds)
+                # Hard cap
                 if now - event["started"] > EVENT_MAX_MS / 1000.0:
                     event["until"] = min(event["until"], now)
 
                 # --- Compute stable direction ---
-                # Use MEDIAN of accumulated rightness — resists outliers
+                # Weighted average of rightness — directional frames dominate,
+                # centered impacts are excluded entirely
                 acc = event["rightness_accum"]
-                median_rightness = float(np.median(acc))
-                side_bias = min(1.0, abs(median_rightness))
+                if len(acc) > 0:
+                    values  = np.array([r for r, w in acc])
+                    weights = np.array([w for r, w in acc])
+                    w_total = weights.sum() + 1e-9
+                    weighted_rightness = float((values * weights).sum() / w_total)
+                else:
+                    weighted_rightness = smooth_rightness
 
-                # Re-evaluate side from accumulated evidence (not per-block)
-                stable_side = "right" if median_rightness >= 0 else "left"
-                # Only allow side flip if strong evidence contradicts initial
+                side_bias = min(1.0, abs(weighted_rightness))
+
+                # Re-evaluate side from accumulated evidence
+                stable_side = "right" if weighted_rightness >= 0 else "left"
                 if stable_side != event["side"]:
-                    if abs(median_rightness) > 0.15 and len(acc) >= 6:
+                    if abs(weighted_rightness) > 0.12 and len(acc) >= 6:
                         event["side"] = stable_side
                         print(f"[SHOT] side corrected → {stable_side} "
-                              f"(median_r={median_rightness:+.3f})")
+                              f"(weighted_r={weighted_rightness:+.3f})")
 
                 total_corr = event["front_score"] + event["back_score"]
                 has_front_back = (
@@ -390,7 +410,7 @@ def main():
                 raw_angle = compute_angle(event["side"], side_bias, is_front)
                 width = compute_width(has_front_back, confidence, separation)
 
-                # Smooth the output angle — no jumping
+                # Smooth output angle
                 output_angle = smooth_angle(output_angle, raw_angle, OUTPUT_ANGLE_EMA)
 
                 publisher.send({
@@ -403,10 +423,12 @@ def main():
                     "confidence":   round(confidence, 3),
                     "rightness":    round(smooth_rightness, 4),
                     "ild_db":       round(ild_db, 2),
+                    "ild_abs":      round(abs_ild, 2),
                     "mouse_dx":     round(mouse_dx, 1),
                     "front_score":  round(event["front_score"], 3),
                     "back_score":   round(event["back_score"], 3),
                     "corr_samples": event["corr_samples"],
+                    "dir_frames":   len(acc),
                     "ts":           now,
                 })
 
@@ -418,7 +440,8 @@ def main():
                     print(f"[SHOT] ended     angle={output_angle:5.1f}°  {fb}  "
                           f"front={f:.2f} back={b:.2f}  "
                           f"samples={event['corr_samples']}  "
-                          f"median_r={median_rightness:+.3f}  "
+                          f"dir_frames={len(acc)}  "
+                          f"weighted_r={weighted_rightness:+.3f}  "
                           f"conf={confidence:.0%}")
 
                     publisher.send({
