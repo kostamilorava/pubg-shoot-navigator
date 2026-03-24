@@ -6,7 +6,6 @@ from collections import deque
 
 import numpy as np
 import soundcard as sc
-from websocket import create_connection
 from pynput import mouse
 
 
@@ -197,42 +196,8 @@ def open_loopback_recorder():
 # Direction logic
 # -----------------------------
 def build_payload(event, current_rightness, current_ild_db, mouse_dx):
-    side = event["side"]
-    evidence = event["front_score"] + event["back_score"]
-    frontish = event["front_score"] >= event["back_score"]
-
-    # strongest observed side bias during current event
-    side_bias = min(1.0, abs(event["best_rightness"]))
-
-    if evidence < 0.8:
-        # Only know left vs right hemisphere
-        center = 90 if side == "right" else 270
-        width = max(100, int(COARSE_WIDTH_DEG - side_bias * 35))
-        confidence = min(0.55, 0.22 + side_bias * 0.33)
-        mode = "coarse"
-    else:
-        # Front/back inference inside current side
-        separation = abs(event["front_score"] - event["back_score"]) / (evidence + 1e-9)
-        confidence = min(1.0, 0.50 + separation * 0.50)
-        mode = "refined"
-
-        if side == "right" and frontish:
-            # front-right: 0..90, more right bias => closer to 90
-            center = 15 + side_bias * 75
-        elif side == "right" and not frontish:
-            # back-right: 90..180, more right bias => closer to 90
-            center = 165 - side_bias * 75
-        elif side == "left" and frontish:
-            # front-left: 360..270, more left bias => closer to 270
-            center = (345 - side_bias * 75) % 360
-        else:
-            # back-left: 180..270, more left bias => closer to 270
-            center = 195 + side_bias * 75
-
-        width = int(max(
-            MIN_REFINED_WIDTH_DEG,
-            100 - confidence * 40 - min(28, evidence * 4)
-        ))
+    start_deg = (center - width / 2.0) % 360.0
+    end_deg = (center + width / 2.0) % 360.0
 
     return {
         "type": "direction",
@@ -241,6 +206,8 @@ def build_payload(event, current_rightness, current_ild_db, mouse_dx):
         "side": side,
         "center_deg": float(center % 360),
         "width_deg": float(width),
+        "start_deg": float(start_deg),
+        "end_deg": float(end_deg),
         "confidence": float(confidence),
         "rightness": float(current_rightness),
         "ild_db": float(current_ild_db),
@@ -361,6 +328,8 @@ def main():
                         "side": event["side"],
                         "center_deg": 0,
                         "width_deg": 0,
+                        "start_deg": 0,
+                        "end_deg": 0,
                         "confidence": 0,
                         "ts": time.time(),
                     })

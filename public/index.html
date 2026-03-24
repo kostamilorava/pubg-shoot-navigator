@@ -1,9 +1,9 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8"/>
+    <meta charset="utf-8" />
     <title>PUBG Direction Ring</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
         html, body {
             margin: 0;
@@ -24,7 +24,6 @@
         canvas {
             width: min(92vw, 92vh);
             height: min(92vw, 92vh);
-            touch-action: manipulation;
         }
 
         .hud {
@@ -36,30 +35,28 @@
             justify-content: space-between;
             gap: 12px;
             font-size: 14px;
-            opacity: 0.9;
-            pointer-events: none;
+            z-index: 2;
         }
 
         .card {
-            background: rgba(255, 255, 255, 0.06);
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.08);
             border-radius: 12px;
             padding: 10px 12px;
             backdrop-filter: blur(6px);
+            max-width: 42vw;
         }
 
         .small {
             font-size: 12px;
             opacity: 0.85;
+            line-height: 1.45;
+            white-space: pre-line;
         }
 
-        .ok {
-            color: #57ff9a;
-        }
-
-        .warn {
-            color: #ffd166;
-        }
+        .ok { color: #57ff9a; }
+        .warn { color: #ffd166; }
+        .bad { color: #ff7b7b; }
     </style>
 </head>
 <body>
@@ -72,12 +69,18 @@
         <div><strong>Direction</strong></div>
         <div id="summary">idle</div>
         <div id="confidence" class="small">confidence: 0%</div>
+        <div id="debug" class="small"></div>
     </div>
 
     <div class="card" style="text-align:right;">
         <div><strong>Status</strong></div>
         <div id="wsStatus" class="warn">connecting...</div>
-        <div class="small">Open this page on phone too</div>
+        <div class="small">
+            0° = front
+            90° = right
+            180° = back
+            270° = left
+        </div>
     </div>
 </div>
 
@@ -87,18 +90,41 @@
 
     const summaryEl = document.getElementById("summary");
     const confidenceEl = document.getElementById("confidence");
+    const debugEl = document.getElementById("debug");
     const wsStatusEl = document.getElementById("wsStatus");
+
+    // If UI orientation is wrong, adjust these:
+    const MIRROR = false;       // set true if left/right appear reversed
+    const ANGLE_OFFSET_DEG = 0; // e.g. 90, 180 if your orientation is rotated
+    const STALE_MS = 3000;      // keep last sector visible a bit longer
 
     const state = {
         active: false,
-        center_deg: 0,
-        width_deg: 0,
-        confidence: 0,
         mode: "idle",
         side: "unknown",
+        center_deg: 0,
+        width_deg: 0,
+        start_deg: 0,
+        end_deg: 0,
+        confidence: 0,
+        rightness: 0,
+        ild_db: 0,
+        mouse_dx: 0,
+        front_score: 0,
+        back_score: 0,
         ts: 0,
         lastMessageMs: 0,
     };
+
+    function normalizeDeg(deg) {
+        return ((deg % 360) + 360) % 360;
+    }
+
+    function applyCalibration(deg) {
+        let d = normalizeDeg(deg + ANGLE_OFFSET_DEG);
+        if (MIRROR) d = normalizeDeg(360 - d);
+        return d;
+    }
 
     function resize() {
         const size = Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.92);
@@ -131,10 +157,10 @@
 
     function drawLabels(cx, cy, radius) {
         const labels = [
-            {text: "0° / FRONT", deg: 0},
-            {text: "90° / RIGHT", deg: 90},
-            {text: "180° / BACK", deg: 180},
-            {text: "270° / LEFT", deg: 270},
+            { text: "FRONT 0°", deg: 0 },
+            { text: "RIGHT 90°", deg: 90 },
+            { text: "BACK 180°", deg: 180 },
+            { text: "LEFT 270°", deg: 270 },
         ];
 
         ctx.fillStyle = "rgba(255,255,255,0.85)";
@@ -144,7 +170,7 @@
 
         for (const label of labels) {
             const a = degToRad(label.deg);
-            const r = radius + 32;
+            const r = radius + 34;
             ctx.fillText(label.text, cx + Math.cos(a) * r, cy + Math.sin(a) * r);
         }
     }
@@ -163,19 +189,32 @@
         ctx.stroke();
     }
 
-    function drawSector(cx, cy, radius, centerDeg, widthDeg, alpha) {
-        const startDeg = centerDeg - widthDeg / 2;
-        const endDeg = centerDeg + widthDeg / 2;
+    function drawSectorRange(cx, cy, radius, startDeg, endDeg, alpha) {
+        startDeg = normalizeDeg(startDeg);
+        endDeg = normalizeDeg(endDeg);
 
         ctx.save();
-        ctx.beginPath();
         ctx.strokeStyle = `rgba(87,255,154,${alpha})`;
         ctx.lineWidth = 26;
         ctx.lineCap = "round";
         ctx.shadowBlur = 24;
         ctx.shadowColor = `rgba(87,255,154,${alpha})`;
-        ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(endDeg), false);
-        ctx.stroke();
+
+        if (startDeg <= endDeg) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(endDeg), false);
+            ctx.stroke();
+        } else {
+            // wrapped across 360
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(360), false);
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, degToRad(0), degToRad(endDeg), false);
+            ctx.stroke();
+        }
+
         ctx.restore();
     }
 
@@ -211,24 +250,67 @@
         drawLabels(cx, cy, radius);
 
         const ageMs = Date.now() - state.lastMessageMs;
-        const fresh = ageMs < 1200;
-        const alpha = state.active && fresh
-            ? Math.max(0.18, 0.35 + state.confidence * 0.65)
-            : 0.0;
+        const fresh = ageMs < STALE_MS;
 
-        if (state.active && fresh && state.width_deg > 0) {
-            drawSector(cx, cy, radius, state.center_deg, state.width_deg, alpha);
+        if (state.active && fresh) {
+            const alpha = Math.max(0.22, 0.35 + state.confidence * 0.65);
+            drawSectorRange(cx, cy, radius, state.start_deg, state.end_deg, alpha);
         }
 
         drawCenter(cx, cy);
 
         summaryEl.textContent = state.active
-            ? `${Math.round(state.center_deg)}° sector, width ${Math.round(state.width_deg)}°`
+            ? `${Math.round(state.center_deg)}° • width ${Math.round(state.width_deg)}°`
             : "idle";
 
         confidenceEl.textContent = `confidence: ${Math.round((state.confidence || 0) * 100)}%`;
 
+        debugEl.textContent =
+            `start: ${Math.round(state.start_deg)}°
+end: ${Math.round(state.end_deg)}°
+side: ${state.side}
+mode: ${state.mode}
+rightness: ${Number(state.rightness || 0).toFixed(3)}
+ILD: ${Number(state.ild_db || 0).toFixed(2)} dB
+mouse_dx: ${Number(state.mouse_dx || 0).toFixed(1)}
+front_score: ${Number(state.front_score || 0).toFixed(2)}
+back_score: ${Number(state.back_score || 0).toFixed(2)}`;
+
         requestAnimationFrame(render);
+    }
+
+    function updateFromPayload(payload) {
+        const rawCenter =
+            typeof payload.center_deg === "number"
+                ? payload.center_deg
+                : 0;
+
+        const rawWidth =
+            typeof payload.width_deg === "number"
+                ? payload.width_deg
+                : 0;
+
+        let rawStart, rawEnd;
+
+        if (typeof payload.start_deg === "number" && typeof payload.end_deg === "number") {
+            rawStart = payload.start_deg;
+            rawEnd = payload.end_deg;
+        } else {
+            rawStart = rawCenter - rawWidth / 2;
+            rawEnd = rawCenter + rawWidth / 2;
+        }
+
+        const center = applyCalibration(rawCenter);
+        const start = applyCalibration(rawStart);
+        const end = applyCalibration(rawEnd);
+
+        Object.assign(state, payload, {
+            center_deg: normalizeDeg(center),
+            start_deg: normalizeDeg(start),
+            end_deg: normalizeDeg(end),
+            width_deg: rawWidth,
+            lastMessageMs: Date.now(),
+        });
     }
 
     function connect() {
@@ -253,9 +335,10 @@
         ws.onmessage = (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                Object.assign(state, payload);
-                state.lastMessageMs = Date.now();
-            } catch (_) {
+                updateFromPayload(payload);
+            } catch (err) {
+                wsStatusEl.textContent = "bad payload";
+                wsStatusEl.className = "bad";
             }
         };
     }
