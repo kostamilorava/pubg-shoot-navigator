@@ -54,9 +54,29 @@
             white-space: pre-line;
         }
 
-        .ok { color: #57ff9a; }
+        .ok   { color: #57ff9a; }
         .warn { color: #ffd166; }
-        .bad { color: #ff7b7b; }
+        .bad  { color: #ff7b7b; }
+
+        /* Correlation progress bar */
+        .corr-bar-wrap {
+            margin-top: 6px;
+            height: 6px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .corr-bar-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 3px;
+            transition: width 0.15s ease, background 0.3s ease;
+        }
+        .corr-label {
+            font-size: 11px;
+            margin-top: 2px;
+            opacity: 0.7;
+        }
     </style>
 </head>
 <body>
@@ -69,6 +89,8 @@
         <div><strong>Direction</strong></div>
         <div id="summary">idle</div>
         <div id="confidence" class="small">confidence: 0%</div>
+        <div class="corr-bar-wrap"><div id="corrBar" class="corr-bar-fill"></div></div>
+        <div id="corrLabel" class="corr-label"></div>
         <div id="debug" class="small"></div>
     </div>
 
@@ -81,6 +103,10 @@
             180° = back
             270° = left
         </div>
+        <div class="small" style="margin-top:6px; opacity:0.5;">
+            Sweep mouse after shot
+            to resolve front / back
+        </div>
     </div>
 </div>
 
@@ -88,15 +114,17 @@
     const canvas = document.getElementById("ring");
     const ctx = canvas.getContext("2d");
 
-    const summaryEl = document.getElementById("summary");
-    const confidenceEl = document.getElementById("confidence");
-    const debugEl = document.getElementById("debug");
-    const wsStatusEl = document.getElementById("wsStatus");
+    const summaryEl     = document.getElementById("summary");
+    const confidenceEl  = document.getElementById("confidence");
+    const corrBarEl     = document.getElementById("corrBar");
+    const corrLabelEl   = document.getElementById("corrLabel");
+    const debugEl       = document.getElementById("debug");
+    const wsStatusEl    = document.getElementById("wsStatus");
 
-    // If UI orientation is wrong, adjust these:
-    const MIRROR = false;       // set true if left/right appear reversed
-    const ANGLE_OFFSET_DEG = 0; // e.g. 90, 180 if your orientation is rotated
-    const STALE_MS = 3000;      // keep last sector visible a bit longer
+    // Calibration — adjust if your orientation feels wrong
+    const MIRROR = false;
+    const ANGLE_OFFSET_DEG = 0;
+    const STALE_MS = 3000;
 
     const state = {
         active: false,
@@ -112,6 +140,7 @@
         mouse_dx: 0,
         front_score: 0,
         back_score: 0,
+        corr_samples: 0,
         ts: 0,
         lastMessageMs: 0,
     };
@@ -143,12 +172,12 @@
     function drawTicks(cx, cy, radius) {
         for (let deg = 0; deg < 360; deg += 15) {
             const a = degToRad(deg);
-            const inner = deg % 90 === 0 ? radius - 22 : radius - 12;
+            const major = deg % 90 === 0;
+            const inner = major ? radius - 22 : radius - 12;
             const outer = radius + 4;
-
             ctx.beginPath();
-            ctx.strokeStyle = deg % 90 === 0 ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.16)";
-            ctx.lineWidth = deg % 90 === 0 ? 3 : 1.5;
+            ctx.strokeStyle = major ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.16)";
+            ctx.lineWidth = major ? 3 : 1.5;
             ctx.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner);
             ctx.lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer);
             ctx.stroke();
@@ -157,21 +186,19 @@
 
     function drawLabels(cx, cy, radius) {
         const labels = [
-            { text: "FRONT 0°", deg: 0 },
-            { text: "RIGHT 90°", deg: 90 },
+            { text: "FRONT 0°",  deg: 0   },
+            { text: "RIGHT 90°", deg: 90  },
             { text: "BACK 180°", deg: 180 },
             { text: "LEFT 270°", deg: 270 },
         ];
-
         ctx.fillStyle = "rgba(255,255,255,0.85)";
         ctx.font = "14px Arial";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-
-        for (const label of labels) {
-            const a = degToRad(label.deg);
+        for (const l of labels) {
+            const a = degToRad(l.deg);
             const r = radius + 34;
-            ctx.fillText(label.text, cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+            ctx.fillText(l.text, cx + Math.cos(a) * r, cy + Math.sin(a) * r);
         }
     }
 
@@ -189,32 +216,50 @@
         ctx.stroke();
     }
 
-    function drawSectorRange(cx, cy, radius, startDeg, endDeg, alpha) {
+    function drawSectorRange(cx, cy, radius, startDeg, endDeg, alpha, isCoarse) {
         startDeg = normalizeDeg(startDeg);
         endDeg = normalizeDeg(endDeg);
 
+        const color = isCoarse
+            ? `rgba(255,209,102,${alpha})`    // yellow for coarse (sweep needed)
+            : `rgba(87,255,154,${alpha})`;     // green for refined
+
         ctx.save();
-        ctx.strokeStyle = `rgba(87,255,154,${alpha})`;
+        ctx.strokeStyle = color;
         ctx.lineWidth = 26;
         ctx.lineCap = "round";
         ctx.shadowBlur = 24;
-        ctx.shadowColor = `rgba(87,255,154,${alpha})`;
+        ctx.shadowColor = color;
 
         if (startDeg <= endDeg) {
             ctx.beginPath();
             ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(endDeg), false);
             ctx.stroke();
         } else {
-            // wrapped across 360
             ctx.beginPath();
             ctx.arc(cx, cy, radius, degToRad(startDeg), degToRad(360), false);
             ctx.stroke();
-
             ctx.beginPath();
             ctx.arc(cx, cy, radius, degToRad(0), degToRad(endDeg), false);
             ctx.stroke();
         }
+        ctx.restore();
+    }
 
+    function drawPointerLine(cx, cy, radius, deg, alpha) {
+        const a = degToRad(deg);
+        const inner = 30;
+        const outer = radius - 16;
+
+        ctx.save();
+        ctx.strokeStyle = `rgba(87,255,154,${alpha})`;
+        ctx.lineWidth = 3;
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = `rgba(87,255,154,${alpha * 0.6})`;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner);
+        ctx.lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer);
+        ctx.stroke();
         ctx.restore();
     }
 
@@ -230,10 +275,12 @@
         ctx.fillText(txt, cx, cy - 10);
 
         ctx.font = "14px Arial";
-        const sub = state.active
-            ? `${state.side} • ${state.mode}`
-            : "waiting for shot";
-        ctx.fillText(sub, cx, cy + 22);
+        if (state.active) {
+            const modeLabel = state.mode === "coarse" ? "sweep to refine" : state.side;
+            ctx.fillText(`${state.side} • ${modeLabel}`, cx, cy + 22);
+        } else {
+            ctx.fillText("waiting for shot", cx, cy + 22);
+        }
     }
 
     function render() {
@@ -253,62 +300,78 @@
         const fresh = ageMs < STALE_MS;
 
         if (state.active && fresh) {
+            const isCoarse = state.mode === "coarse";
             const alpha = Math.max(0.22, 0.35 + state.confidence * 0.65);
-            drawSectorRange(cx, cy, radius, state.start_deg, state.end_deg, alpha);
+            drawSectorRange(cx, cy, radius, state.start_deg, state.end_deg, alpha, isCoarse);
+
+            // Draw center pointer line when refined
+            if (!isCoarse) {
+                drawPointerLine(cx, cy, radius, state.center_deg, alpha * 0.7);
+            }
         }
 
         drawCenter(cx, cy);
 
+        // HUD text
         summaryEl.textContent = state.active
             ? `${Math.round(state.center_deg)}° • width ${Math.round(state.width_deg)}°`
             : "idle";
 
         confidenceEl.textContent = `confidence: ${Math.round((state.confidence || 0) * 100)}%`;
 
+        // Correlation progress bar
+        if (state.active) {
+            const totalCorr = (state.front_score || 0) + (state.back_score || 0);
+            const progress = Math.min(1.0, totalCorr / 2.0);  // fills at ~2.0 total score
+            corrBarEl.style.width = (progress * 100) + "%";
+
+            if (state.mode === "coarse") {
+                corrBarEl.style.background = "#ffd166";
+                corrLabelEl.textContent = state.corr_samples > 0
+                    ? `correlating... (${state.corr_samples} samples)`
+                    : "sweep mouse now ↔";
+            } else {
+                corrBarEl.style.background = "#57ff9a";
+                const fb = state.front_score >= state.back_score ? "FRONT" : "BACK";
+                corrLabelEl.textContent = `${fb} resolved (${state.corr_samples} samples)`;
+            }
+        } else {
+            corrBarEl.style.width = "0%";
+            corrLabelEl.textContent = "";
+        }
+
         debugEl.textContent =
-            `start: ${Math.round(state.start_deg)}°
-end: ${Math.round(state.end_deg)}°
-side: ${state.side}
-mode: ${state.mode}
+            `side: ${state.side}  mode: ${state.mode}
 rightness: ${Number(state.rightness || 0).toFixed(3)}
 ILD: ${Number(state.ild_db || 0).toFixed(2)} dB
 mouse_dx: ${Number(state.mouse_dx || 0).toFixed(1)}
-front_score: ${Number(state.front_score || 0).toFixed(2)}
-back_score: ${Number(state.back_score || 0).toFixed(2)}`;
+front: ${Number(state.front_score || 0).toFixed(2)}  back: ${Number(state.back_score || 0).toFixed(2)}`;
 
         requestAnimationFrame(render);
     }
 
     function updateFromPayload(payload) {
-        const rawCenter =
-            typeof payload.center_deg === "number"
-                ? payload.center_deg
-                : 0;
-
-        const rawWidth =
-            typeof payload.width_deg === "number"
-                ? payload.width_deg
-                : 0;
+        const rawCenter = typeof payload.center_deg === "number" ? payload.center_deg : 0;
+        const rawWidth  = typeof payload.width_deg  === "number" ? payload.width_deg  : 0;
 
         let rawStart, rawEnd;
-
         if (typeof payload.start_deg === "number" && typeof payload.end_deg === "number") {
             rawStart = payload.start_deg;
-            rawEnd = payload.end_deg;
+            rawEnd   = payload.end_deg;
         } else {
             rawStart = rawCenter - rawWidth / 2;
-            rawEnd = rawCenter + rawWidth / 2;
+            rawEnd   = rawCenter + rawWidth / 2;
         }
 
         const center = applyCalibration(rawCenter);
-        const start = applyCalibration(rawStart);
-        const end = applyCalibration(rawEnd);
+        const start  = applyCalibration(rawStart);
+        const end    = applyCalibration(rawEnd);
 
         Object.assign(state, payload, {
-            center_deg: normalizeDeg(center),
-            start_deg: normalizeDeg(start),
-            end_deg: normalizeDeg(end),
-            width_deg: rawWidth,
+            center_deg:   normalizeDeg(center),
+            start_deg:    normalizeDeg(start),
+            end_deg:      normalizeDeg(end),
+            width_deg:    rawWidth,
             lastMessageMs: Date.now(),
         });
     }
@@ -328,14 +391,11 @@ back_score: ${Number(state.back_score || 0).toFixed(2)}`;
             setTimeout(connect, 1000);
         };
 
-        ws.onerror = () => {
-            ws.close();
-        };
+        ws.onerror = () => ws.close();
 
         ws.onmessage = (event) => {
             try {
-                const payload = JSON.parse(event.data);
-                updateFromPayload(payload);
+                updateFromPayload(JSON.parse(event.data));
             } catch (err) {
                 wsStatusEl.textContent = "bad payload";
                 wsStatusEl.className = "bad";
