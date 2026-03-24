@@ -327,6 +327,9 @@ def main():
                     event["until"] = min(event["until"], now)
 
                 # --- Build direction estimate ---
+                center = 0.0
+                width = COARSE_WIDTH_DEG
+                confidence = 0.0
                 side_bias = min(1.0, abs(event["best_rightness"]))
                 total_corr = event["front_score"] + event["back_score"]
                 has_front_back = (
