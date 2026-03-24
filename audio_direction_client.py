@@ -1,5 +1,4 @@
 import json
-import math
 import time
 import threading
 from collections import deque
@@ -7,34 +6,43 @@ from collections import deque
 import numpy as np
 import soundcard as sc
 from pynput import mouse
+from websocket import create_connection
 
 
-# -----------------------------
-# Hardcoded server IP / settings
-# -----------------------------
+# ============================================================
+# CONFIG
+# ============================================================
+
 WS_URL = "ws://192.168.1.50:8080/ws?role=producer"   # <-- change this
 SAMPLE_RATE = 48000
 BLOCK_SIZE = 1024
 
-# Detection tuning
+# If left/right is reversed, set this to True
+SWAP_CHANNELS = False
+
+# Detection / timing
 SHOT_MIN_GAP_MS = 180
-EVENT_HOLD_MS = 850
+EVENT_HOLD_MS = 900
+MOTION_WINDOW_MS = 70
+MOVE_MIN_PIXELS = 6
+
+# Trigger sensitivity
 FLUX_TRIGGER_Z = 3.5
 RMS_TRIGGER_MULT = 2.4
 ABS_MIN_RMS = 0.006
 
-# Mouse tuning
-MOTION_WINDOW_MS = 60
-MOVE_MIN_PIXELS = 6
-
-# UI tuning
+# Sector sizes
 COARSE_WIDTH_DEG = 160
 MIN_REFINED_WIDTH_DEG = 24
 
+# Idle publish rate, so UI does not look dead
+IDLE_HEARTBEAT_MS = 500
 
-# -----------------------------
-# Shared mouse state
-# -----------------------------
+
+# ============================================================
+# MOUSE STATE
+# ============================================================
+
 mouse_events = deque(maxlen=4000)
 mouse_lock = threading.Lock()
 _last_mouse_x = None
@@ -64,7 +72,6 @@ def get_recent_mouse_dx(window_ms=MOTION_WINDOW_MS):
     total = 0.0
 
     with mouse_lock:
-        # prune old
         while mouse_events and mouse_events[0][0] < cutoff - 1.0:
             mouse_events.popleft()
 
@@ -75,16 +82,17 @@ def get_recent_mouse_dx(window_ms=MOTION_WINDOW_MS):
     return total
 
 
-# -----------------------------
-# WebSocket publisher
-# -----------------------------
+# ============================================================
+# WEBSOCKET PUBLISHER
+# ============================================================
+
 class Publisher:
-    def __init__(self, url):
+    def __init__(self, url: str):
         self.url = url
         self.ws = None
         self.last_try = 0.0
 
-    def ensure(self):
+    def ensure(self) -> bool:
         if self.ws is not None:
             return True
 
@@ -93,6 +101,7 @@ class Publisher:
             return False
 
         self.last_try = now
+
         try:
             self.ws = create_connection(self.url, timeout=2)
             print(f"[WS] Connected to {self.url}")
@@ -102,13 +111,14 @@ class Publisher:
             self.ws = None
             return False
 
-    def send(self, payload):
+    def send(self, payload: dict) -> None:
         if not self.ensure():
             return
 
         try:
             self.ws.send(json.dumps(payload))
-        except Exception:
+        except Exception as exc:
+            print(f"[WS] Send failed: {exc}")
             try:
                 self.ws.close()
             except Exception:
@@ -116,10 +126,11 @@ class Publisher:
             self.ws = None
 
 
-# -----------------------------
-# Audio helpers
-# -----------------------------
-def to_stereo(block):
+# ============================================================
+# AUDIO HELPERS
+# ============================================================
+
+def to_stereo(block) -> np.ndarray:
     arr = np.asarray(block, dtype=np.float32)
 
     if arr.ndim == 1:
@@ -128,18 +139,21 @@ def to_stereo(block):
     if arr.shape[1] > 2:
         arr = arr[:, :2]
 
+    if SWAP_CHANNELS:
+        arr = arr[:, ::-1]
+
     return arr
 
 
-def rms(x):
+def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(x)) + 1e-12))
 
 
-def compute_rightness(stereo):
+def compute_rightness(stereo: np.ndarray):
     """
     Returns:
-        rightness in [-1, 1]
-        ild_db
+        rightness: [-1, 1]
+        ild_db: interaural level difference in dB (R vs L)
     """
     left = stereo[:, 0]
     right = stereo[:, 1]
@@ -149,12 +163,12 @@ def compute_rightness(stereo):
 
     ild_db = 20.0 * np.log10((r_rms + 1e-9) / (l_rms + 1e-9))
 
-    # squash into [-1, 1]
+    # Smoothly squash dB ratio into [-1, 1]
     rightness = float(np.tanh(ild_db / 8.0))
     return rightness, float(ild_db)
 
 
-def spectral_flux_mag(mono):
+def spectral_flux_mag(mono: np.ndarray) -> np.ndarray:
     windowed = mono * np.hanning(len(mono))
     mag = np.abs(np.fft.rfft(windowed))
     return mag
@@ -162,49 +176,99 @@ def spectral_flux_mag(mono):
 
 def open_loopback_recorder():
     """
-    Best effort loopback selection.
-    Works best on Windows with WASAPI loopback.
+    Best effort: try to capture system output / loopback.
+    Works best on Windows.
     """
-    default_speaker = sc.default_speaker()
-    print(f"[AUDIO] Default speaker: {default_speaker.name}")
+    try:
+        default_speaker = sc.default_speaker()
+        print(f"[AUDIO] Default speaker: {default_speaker.name}")
+    except Exception as exc:
+        raise RuntimeError(f"Could not get default speaker: {exc}") from exc
 
-    # Try to find matching loopback microphone
     try:
         loopbacks = sc.all_microphones(include_loopback=True)
         for mic in loopbacks:
             mic_name = getattr(mic, "name", str(mic))
             if default_speaker.name in mic_name or mic_name in default_speaker.name:
-                print(f"[AUDIO] Using loopback mic: {mic_name}")
+                print(f"[AUDIO] Using loopback device: {mic_name}")
                 return mic.recorder(
                     samplerate=SAMPLE_RATE,
                     channels=2,
                     blocksize=BLOCK_SIZE,
                 )
     except Exception as exc:
-        print(f"[AUDIO] Loopback mic search failed: {exc}")
+        print(f"[AUDIO] Loopback scan failed: {exc}")
 
-    # Fallback
-    print("[AUDIO] Falling back to speaker recorder")
-    return default_speaker.recorder(
-        samplerate=SAMPLE_RATE,
-        channels=2,
-        blocksize=BLOCK_SIZE,
-    )
+    # fallback
+    try:
+        default_mic = sc.default_microphone()
+        print(f"[AUDIO] Loopback not found, falling back to microphone: {default_mic.name}")
+        return default_mic.recorder(
+            samplerate=SAMPLE_RATE,
+            channels=2,
+            blocksize=BLOCK_SIZE,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not open loopback or microphone recorder. "
+            "You likely need a working loopback device."
+        ) from exc
 
 
-# -----------------------------
-# Direction logic
-# -----------------------------
-def build_payload(event, current_rightness, current_ild_db, mouse_dx):
-    start_deg = (center - width / 2.0) % 360.0
-    end_deg = (center + width / 2.0) % 360.0
+# ============================================================
+# DIRECTION / PAYLOAD
+# ============================================================
+
+def normalize_deg(deg: float) -> float:
+    return deg % 360.0
+
+
+def build_payload(event: dict, current_rightness: float, current_ild_db: float, mouse_dx: float) -> dict:
+    side = event["side"]
+    evidence = event["front_score"] + event["back_score"]
+    frontish = event["front_score"] >= event["back_score"]
+
+    side_bias = min(1.0, abs(event["best_rightness"]))
+
+    if evidence < 0.8:
+        # Only hemisphere is known
+        center = 90.0 if side == "right" else 270.0
+        width = max(100.0, COARSE_WIDTH_DEG - side_bias * 35.0)
+        confidence = min(0.55, 0.22 + side_bias * 0.33)
+        mode = "coarse"
+    else:
+        # Refine within the hemisphere
+        separation = abs(event["front_score"] - event["back_score"]) / (evidence + 1e-9)
+        confidence = min(1.0, 0.50 + separation * 0.50)
+        mode = "refined"
+
+        if side == "right" and frontish:
+            # front-right: 0..90
+            center = 15.0 + side_bias * 75.0
+        elif side == "right" and not frontish:
+            # back-right: 90..180
+            center = 165.0 - side_bias * 75.0
+        elif side == "left" and frontish:
+            # front-left: 270..360
+            center = normalize_deg(345.0 - side_bias * 75.0)
+        else:
+            # back-left: 180..270
+            center = 195.0 + side_bias * 75.0
+
+        width = max(
+            MIN_REFINED_WIDTH_DEG,
+            100.0 - confidence * 40.0 - min(28.0, evidence * 4.0),
+        )
+
+    start_deg = normalize_deg(center - width / 2.0)
+    end_deg = normalize_deg(center + width / 2.0)
 
     return {
         "type": "direction",
         "active": True,
         "mode": mode,
         "side": side,
-        "center_deg": float(center % 360),
+        "center_deg": float(normalize_deg(center)),
         "width_deg": float(width),
         "start_deg": float(start_deg),
         "end_deg": float(end_deg),
@@ -218,6 +282,30 @@ def build_payload(event, current_rightness, current_ild_db, mouse_dx):
     }
 
 
+def idle_payload() -> dict:
+    return {
+        "type": "direction",
+        "active": False,
+        "mode": "idle",
+        "side": "unknown",
+        "center_deg": 0.0,
+        "width_deg": 0.0,
+        "start_deg": 0.0,
+        "end_deg": 0.0,
+        "confidence": 0.0,
+        "rightness": 0.0,
+        "ild_db": 0.0,
+        "mouse_dx": 0.0,
+        "front_score": 0.0,
+        "back_score": 0.0,
+        "ts": time.time(),
+    }
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
 def main():
     start_mouse_listener()
     publisher = Publisher(WS_URL)
@@ -227,11 +315,13 @@ def main():
     flux_dev = 1.0
     noise_rms = 0.002
     last_trigger_time = 0.0
+    last_idle_publish = 0.0
 
     event = None
 
     print("[INFO] Starting audio direction producer...")
-    print(f"[INFO] WS -> {WS_URL}")
+    print(f"[INFO] WS URL: {WS_URL}")
+    print(f"[INFO] SWAP_CHANNELS={SWAP_CHANNELS}")
 
     with open_loopback_recorder() as recorder:
         while True:
@@ -252,14 +342,12 @@ def main():
             flux = float(np.maximum(mag - prev_mag, 0.0).sum())
             prev_mag = mag
 
-            # z-score-ish onset detector
             flux_z = (flux - flux_mean) / (flux_dev + 1e-6)
 
-            # update background stats
+            # Update rolling baseline
             flux_mean = 0.98 * flux_mean + 0.02 * flux
             flux_dev = 0.98 * flux_dev + 0.02 * max(1.0, abs(flux - flux_mean))
 
-            # update noise floor only when not inside active event
             if event is None:
                 noise_rms = 0.995 * noise_rms + 0.005 * current_rms
 
@@ -269,8 +357,8 @@ def main():
                 and (now - last_trigger_time) > (SHOT_MIN_GAP_MS / 1000.0)
             )
 
-            side = "right" if current_rightness >= 0 else "left"
             mouse_dx = get_recent_mouse_dx()
+            side = "right" if current_rightness >= 0 else "left"
 
             if shot_trigger:
                 last_trigger_time = now
@@ -285,24 +373,24 @@ def main():
                         "front_score": 0.0,
                         "back_score": 0.0,
                     }
-                    print(f"[SHOT] start side={side} rightness={current_rightness:.3f}")
+                    print(
+                        f"[SHOT] start | side={side} | "
+                        f"rms={current_rms:.5f} | flux_z={flux_z:.2f} | "
+                        f"rightness={current_rightness:.3f} | ild_db={current_ild_db:.2f}"
+                    )
                 else:
-                    # same burst / repeated shots -> keep event alive
                     event["until"] = max(event["until"], now + (EVENT_HOLD_MS / 1000.0))
 
             if event is not None:
-                # If side flips during event, keep original side; short blocks can wobble
-                event["best_rightness"] = (
-                    current_rightness
-                    if abs(current_rightness) > abs(event["best_rightness"])
-                    else event["best_rightness"]
-                )
+                # Keep strongest hemisphere evidence seen during event
+                if abs(current_rightness) > abs(event["best_rightness"]):
+                    event["best_rightness"] = current_rightness
 
                 delta_r = current_rightness - event["last_rightness"]
 
                 # Heuristic:
-                # mouse_dx * delta_rightness < 0  => front side within hemisphere
-                # mouse_dx * delta_rightness > 0  => back side within hemisphere
+                # mouse_dx * delta_rightness < 0 => more frontish
+                # mouse_dx * delta_rightness > 0 => more backish
                 if abs(mouse_dx) >= MOVE_MIN_PIXELS and abs(delta_r) >= 0.015:
                     score = abs(mouse_dx * delta_r)
 
@@ -313,7 +401,7 @@ def main():
 
                 event["last_rightness"] = current_rightness
 
-                # If energy stays active, let event live slightly longer
+                # Extend while sound still remains somewhat active
                 if current_rms > max(noise_rms * 1.6, ABS_MIN_RMS * 0.8):
                     event["until"] = max(event["until"], now + 0.05)
 
@@ -321,20 +409,19 @@ def main():
                 publisher.send(payload)
 
                 if now > event["until"]:
-                    publisher.send({
-                        "type": "direction",
-                        "active": False,
-                        "mode": "idle",
-                        "side": event["side"],
-                        "center_deg": 0,
-                        "width_deg": 0,
-                        "start_deg": 0,
-                        "end_deg": 0,
-                        "confidence": 0,
-                        "ts": time.time(),
-                    })
-                    print("[SHOT] end")
+                    print(
+                        f"[SHOT] end | side={event['side']} | "
+                        f"front_score={event['front_score']:.3f} | "
+                        f"back_score={event['back_score']:.3f}"
+                    )
+                    publisher.send(idle_payload())
                     event = None
+
+            else:
+                # Heartbeat while idle, useful for UI/debug
+                if now - last_idle_publish >= (IDLE_HEARTBEAT_MS / 1000.0):
+                    publisher.send(idle_payload())
+                    last_idle_publish = now
 
 
 if __name__ == "__main__":
