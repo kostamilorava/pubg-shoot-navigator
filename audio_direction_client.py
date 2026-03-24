@@ -31,7 +31,7 @@ ABS_MIN_RMS       = 0.003   # lowered from 0.005
 
 # Event timing
 EVENT_HOLD_MS     = 1400    # keep alive after last trigger
-EVENT_MAX_MS      = 5000    # hard cap
+EVENT_MAX_MS      = 15000   # hard cap — auto fire can last many seconds
 
 # ILD / rightness
 RIGHTNESS_EMA     = 0.18    # slower smoothing = more stable (was 0.35)
@@ -274,8 +274,16 @@ def main():
             prev_mag = mag
 
             flux_z = (flux - flux_mean) / (flux_dev + 1e-6)
-            flux_mean = 0.98 * flux_mean + 0.02 * flux
-            flux_dev  = 0.98 * flux_dev  + 0.02 * max(1.0, abs(flux - flux_mean))
+
+            # Slow down flux adaptation during active events —
+            # otherwise sustained auto fire becomes "normal" in ~2s
+            # and the detector stops triggering
+            if event is None:
+                flux_alpha = 0.02        # normal rate
+            else:
+                flux_alpha = 0.002       # 10x slower during event
+            flux_mean = (1 - flux_alpha) * flux_mean + flux_alpha * flux
+            flux_dev  = (1 - flux_alpha) * flux_dev  + flux_alpha * max(1.0, abs(flux - flux_mean))
 
             if event is None:
                 noise_rms = 0.995 * noise_rms + 0.005 * current_rms
@@ -303,6 +311,7 @@ def main():
                         "front_score":      0.0,
                         "back_score":       0.0,
                         "corr_samples":     0,
+                        "frozen_noise":     noise_rms,       # snapshot — doesn't drift
                     }
                     print(f"[SHOT] detected  side={side}  "
                           f"rightness={smooth_rightness:+.3f}  "
@@ -330,11 +339,19 @@ def main():
                         event["back_score"] += score
                     event["corr_samples"] += 1
 
-                # Keep alive while audio present
-                if current_rms > max(noise_rms * 1.4, ABS_MIN_RMS * 0.7):
-                    event["until"] = max(event["until"], now + 0.06)
+                # --- Energy sustain ---
+                # Use the frozen noise floor from event start, NOT the live
+                # one which drifts upward during sustained fire.
+                # Two tiers:
+                #   Strong energy (2x frozen) → extend generously (300ms)
+                #   Moderate energy (1.3x frozen) → extend a bit (80ms)
+                fn = event["frozen_noise"]
+                if current_rms > max(fn * 2.0, ABS_MIN_RMS):
+                    event["until"] = max(event["until"], now + 0.30)
+                elif current_rms > max(fn * 1.3, ABS_MIN_RMS * 0.5):
+                    event["until"] = max(event["until"], now + 0.08)
 
-                # Hard cap
+                # Hard cap (sustained auto fire can last many seconds)
                 if now - event["started"] > EVENT_MAX_MS / 1000.0:
                     event["until"] = min(event["until"], now)
 
